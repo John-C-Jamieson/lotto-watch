@@ -8,8 +8,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "run | dry-run | test-notify"
-        default: "run"
+        description: "What to do"
+        type: choice
+        options: [run, dry-run, test-notify]
+        default: run
 
 permissions:
   contents: write   # to commit state.json back so alerts aren't repeated
@@ -42,8 +44,10 @@ jobs:
           LOTTO_MAX_WARN_AT: ${{ vars.LOTTO_MAX_WARN_AT }}
           ALERT_EVERY_CAPPED_DRAW: ${{ vars.ALERT_EVERY_CAPPED_DRAW }}
           HEARTBEAT_WEEKDAY: ${{ vars.HEARTBEAT_WEEKDAY }}
+          # Passed through env rather than pasted into the script, so it can't inject shell.
+          MODE: ${{ inputs.mode || 'run' }}
         run: |
-          case "${{ github.event.inputs.mode || 'run' }}" in
+          case "$MODE" in
             dry-run)     python lotto_watch.py --dry-run ;;
             test-notify) python lotto_watch.py --test-notify ;;
             *)           python lotto_watch.py ;;

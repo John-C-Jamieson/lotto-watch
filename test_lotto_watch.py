@@ -1,6 +1,8 @@
 """Run with:  python -m unittest -v"""
 import datetime as dt
+import os
 import unittest
+from unittest import mock
 
 import lotto_watch as lw
 
@@ -67,6 +69,13 @@ class ParseLottoMax(unittest.TestCase):
         tue_morning = dt.datetime(2026, 9, 29, 9, 0, tzinfo=TZ)
         self.assertEqual(lw.next_lotto_max_draw(tue_morning), dt.date(2026, 9, 29))
 
+    def test_html_comments_ignored(self):
+        # The live PlayNow page has stale promo text inside <!-- -->.
+        page = "<p>Live</p><!-- <p>Lotto 6/49 SuperDraw on December 19, 2026</p> -->"
+        self.assertEqual(lw.to_text(page), "Live")
+        found, _ = lw.find_super_draws(NOW.date(), fake_fetcher({"playnow.com": page}))
+        self.assertEqual(found, {})
+
 
 class LottoMaxAlerts(unittest.TestCase):
     def test_sequence(self):
@@ -85,20 +94,32 @@ class LottoMaxAlerts(unittest.TestCase):
             ["Lotto Max getting close to the max"],          # re-armed
         ])
 
+    def test_small_dip_between_sources_does_not_rewarn(self):
+        s = {}
+        draw = dt.date(2026, 10, 9)
+        self.assertEqual(len(lw.check_lotto_max(s, 85_000_000, draw)), 1)  # WCLC
+        self.assertEqual(lw.check_lotto_max(s, 84_500_000, draw), [])      # lottery.fm, rounded lower
+
 
 class SuperDraws(unittest.TestCase):
     def test_future_announcement_and_reminder(self):
         s = {}
         f = fake_fetcher({"playnow.com": PLAYNOW_SUPER, "wclc.com": WCLC_HOME})
         found, ok = lw.find_super_draws(NOW.date(), f)
-        self.assertEqual(ok, 2)
-        self.assertIn("2026-10-24", found)
-        self.assertIn("Lotto 6/49", found["2026-10-24"])
+        self.assertEqual(ok, 1)  # WCLC loaded but doesn't mention a Super Draw
+        self.assertEqual(found["2026-10-24"], (
+            "Lotto 6/49", "Lotto 6/49 Super Draw on Saturday, October 24, 2026 (via PlayNow (BCLC))"))
         a = lw.check_super_draws(s, found, NOW.date())
         self.assertEqual([x["title"] for x in a], ["Super Draw announced"])
         self.assertEqual(lw.check_super_draws(s, found, NOW.date()), [])  # no repeat
         a = lw.check_super_draws(s, found, dt.date(2026, 10, 24))
         self.assertEqual([x["title"] for x in a], ["Super Draw is TONIGHT"])
+
+    def test_reminder_names_the_right_game(self):
+        s = {}
+        lw.check_super_draws(s, {"2026-11-05": ("Daily Grand", "Daily Grand Super Draw")}, NOW.date())
+        a = lw.check_super_draws(s, {}, dt.date(2026, 11, 5))  # page no longer lists it
+        self.assertTrue(a[0]["body"].startswith("Daily Grand Super Draw tonight"))
 
     def test_past_super_draw_ignored(self):
         found, _ = lw.find_super_draws(NOW.date(), fake_fetcher({"playnow.com": PLAYNOW_PAST}))
@@ -112,11 +133,12 @@ class SuperDraws(unittest.TestCase):
 
     def test_olg_month_then_exact_date_no_duplicate(self):
         s = {}
-        a = lw.check_super_draws(s, {"2026-11": "Super Draw in November 2026"}, NOW.date())
+        month = {"2026-11": ("Lotto 6/49", "Super Draw in November 2026")}
+        a = lw.check_super_draws(s, month, NOW.date())
         self.assertEqual(len(a), 1)
-        a = lw.check_super_draws(s, {"2026-11-21": "Super Draw Nov 21"}, NOW.date())
+        a = lw.check_super_draws(s, {"2026-11-21": ("Lotto 6/49", "Super Draw Nov 21")}, NOW.date())
         self.assertEqual(a, [])
-        a = lw.check_super_draws(s, {"2026-11": "Super Draw in November 2026"}, NOW.date())
+        a = lw.check_super_draws(s, month, NOW.date())
         self.assertEqual(a, [])
 
 
@@ -132,6 +154,46 @@ class Health(unittest.TestCase):
         f = fake_fetcher({"wclc.com": WCLC_HOME_CAPPED, "playnow.com": PLAYNOW_SUPER})
         titles = [a["title"] for a in lw.run(s, NOW, f)]
         self.assertEqual(titles, ["Lotto Max is at the MAX", "Super Draw announced"])
+
+    def test_super_draw_page_gone_is_noticed(self):
+        # WCLC keeps loading, but PlayNow's Super Draw page 404s.
+        s = {}
+        f = fake_fetcher({"wclc.com": WCLC_HOME})
+        titles = [[a["title"] for a in lw.run(s, NOW, f)] for _ in range(3)]
+        self.assertEqual(titles, [[], [], ["Lotto watch needs attention"]])
+
+    def test_bad_setting_falls_back_and_is_reported(self):
+        with mock.patch.dict(os.environ, {"HEARTBEAT_WEEKDAY": "Mon"}), \
+                mock.patch.object(lw, "CONFIG_ERRORS", []):
+            self.assertEqual(lw.env_int("HEARTBEAT_WEEKDAY", -1), -1)
+            self.assertEqual(len(lw.CONFIG_ERRORS), 1)
+
+
+class Outbox(unittest.TestCase):
+    A = {"title": "A", "body": "a", "priority": "default", "tags": ""}
+    B = {"title": "B", "body": "b", "priority": "default", "tags": ""}
+
+    def test_failed_alert_retried_without_repeating_sent_ones(self):
+        s, sent = {}, []
+
+        def flaky(alert, dry_run):
+            if alert["title"] == "B":
+                raise RuntimeError("down")
+            sent.append(alert["title"])
+
+        self.assertEqual(lw.send_all(s, [self.A, self.B], NOW.date(), False, flaky), 1)
+        self.assertEqual((sent, s["outbox"]), (["A"], [self.B]))
+        # Next run: B goes out, A isn't sent again.
+        works = lambda alert, dry_run: sent.append(alert["title"])
+        self.assertEqual(lw.send_all(s, [], NOW.date(), False, works), 0)
+        self.assertEqual(sent, ["A", "B"])
+        self.assertNotIn("outbox", s)
+
+    def test_stale_retry_dropped(self):
+        s = {"outbox": [dict(self.A, expires="2026-09-25")]}  # draw was yesterday
+        sent = []
+        lw.send_all(s, [], NOW.date(), False, lambda alert, dry_run: sent.append(alert["title"]))
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

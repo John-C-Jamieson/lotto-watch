@@ -41,9 +41,19 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
 
+CONFIG_ERRORS: list[str] = []
+
+
 def env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
-    return int(v) if v else default
+    if not v:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        # Don't crash before alerts go out; main() fails the run afterwards so it gets noticed.
+        CONFIG_ERRORS.append(f"{name}={v!r} is not a whole number, using {default}")
+        return default
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -55,6 +65,8 @@ CAP = env_int("LOTTO_MAX_CAP", 90_000_000)
 WARN_AT = env_int("LOTTO_MAX_WARN_AT", 80_000_000)
 ALERT_EVERY_CAPPED_DRAW = env_bool("ALERT_EVERY_CAPPED_DRAW", True)
 FAIL_ALERT_AFTER = env_int("FAIL_ALERT_AFTER", 3)
+# A drop smaller than this is treated as noise (sources round differently), not a win.
+RESET_DROP = 5_000_000
 
 # Where the data comes from. WCLC is one of the official operators and renders the
 # next Lotto Max jackpot server-side; lottery.fm is an independent fallback.
@@ -66,12 +78,9 @@ SUPER_DRAW_PAGES = [
     ("PlayNow (BCLC)", "https://www.playnow.com/lottery/promotions/649-super-draw/"),
     ("WCLC", "https://www.wclc.com/home.htm"),
 ]
-# OLG publishes game conditions for each Super Draw ahead of time. It has used both
-# of these URL patterns, so we probe the current month and the next few.
-OLG_CONDITION_URLS = [
-    "https://www.olg.ca/en/lottery/game-conditions/lotto-649-super-draw/{month}-{year}.html",
-    "https://www.olg.ca/en/lottery/game-conditions/super-draw-conditions-{mon}-{year}.html",
-]
+# OLG publishes game conditions for each Super Draw ahead of time at a predictable URL
+# (seen for Nov 2025, Dec 2025, Aug 2026), so we probe the current month and the next few.
+OLG_CONDITION_URL = "https://www.olg.ca/en/lottery/game-conditions/lotto-649-super-draw/{month}-{year}.html"
 OLG_MONTHS_AHEAD = 3
 
 MONTHS = ["january", "february", "march", "april", "may", "june", "july",
@@ -98,6 +107,7 @@ def fetch(url: str, timeout: int = 30) -> tuple[int, str]:
 
 def to_text(page: str) -> str:
     """HTML -> one line of plain text. Parsing works on this, so layout changes hurt less."""
+    page = re.sub(r"(?s)<!--.*?-->", " ", page)  # commented-out drafts/stale promos
     page = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", page)
     page = re.sub(r"(?s)<[^>]+>", " ", page)
     return re.sub(r"\s+", " ", html.unescape(page)).strip()
@@ -110,6 +120,11 @@ def parse_date(month: str, day: str, year: str) -> dt.date | None:
         return dt.date(int(year), idx + 1, int(day)) if idx is not None else None
     except ValueError:
         return None
+
+
+def long_date(d: dt.date) -> str:
+    """'Saturday, October 24, 2026' (strftime's %-d doesn't work on Windows)."""
+    return f"{d:%A, %B} {d.day}, {d.year}"
 
 
 # --------------------------------------------------------------------------- Lotto Max
@@ -183,11 +198,11 @@ def check_lotto_max(state: dict, amount: int, draw: dt.date) -> list[dict]:
     lm = state.setdefault("lotto_max", {})
     alerts = []
     draw_s = draw.isoformat()
-    when = draw.strftime("%A, %B %-d")
+    when = f"{draw:%A, %B} {draw.day}"
 
     # Jackpot was won (or dropped below our thresholds): re-arm the alerts for next time.
     floor = min(WARN_AT or CAP, CAP)
-    if amount < floor or amount < lm.get("last_jackpot", 0):
+    if amount < floor or amount < lm.get("last_jackpot", 0) - RESET_DROP:
         lm.pop("warned", None)
         lm.pop("capped", None)
         lm.pop("last_cap_draw", None)
@@ -199,7 +214,7 @@ def check_lotto_max(state: dict, amount: int, draw: dt.date) -> list[dict]:
                 "title": "Lotto Max is at the MAX" if first else "Lotto Max still at the max",
                 "body": (f"{fmt_money(amount)} jackpot for {when}'s draw (10:30 pm ET). "
                          f"Anything above the cap goes into extra $1M MaxMillions prizes."),
-                "priority": "high", "tags": "moneybag,rotating_light",
+                "priority": "high", "tags": "moneybag,rotating_light", "expires": draw_s,
             })
             lm["capped"] = True
             lm["last_cap_draw"] = draw_s
@@ -208,7 +223,7 @@ def check_lotto_max(state: dict, amount: int, draw: dt.date) -> list[dict]:
             "title": "Lotto Max getting close to the max",
             "body": (f"{fmt_money(amount)} for {when}'s draw. The cap is {fmt_money(CAP)}, "
                      f"usually a draw or two away if nobody wins."),
-            "priority": "default", "tags": "chart_with_upwards_trend",
+            "priority": "default", "tags": "chart_with_upwards_trend", "expires": draw_s,
         })
         lm["warned"] = True
 
@@ -243,19 +258,17 @@ def olg_condition_urls(today: dt.date) -> list[tuple[str, dt.date]]:
     out = []
     y, m = today.year, today.month
     for _ in range(OLG_MONTHS_AHEAD + 1):
-        month = MONTHS[m - 1]
-        for pattern in OLG_CONDITION_URLS:
-            out.append((pattern.format(month=month, mon=month[:3], year=y), dt.date(y, m, 1)))
+        out.append((OLG_CONDITION_URL.format(month=MONTHS[m - 1], year=y), dt.date(y, m, 1)))
         m += 1
         if m == 13:
             y, m = y + 1, 1
     return out
 
 
-def find_super_draws(today: dt.date, fetcher=fetch) -> tuple[dict[str, str], int]:
-    """Returns ({key: description}, number_of_sources_that_worked).
+def find_super_draws(today: dt.date, fetcher=fetch) -> tuple[dict[str, tuple[str, str]], int]:
+    """Returns ({key: (game, description)}, number of pages that loaded and mention Super Draws).
     key is an ISO date when known, else YYYY-MM when only the month is known."""
-    found: dict[str, str] = {}
+    found: dict[str, tuple[str, str]] = {}
     ok = 0
     for name, url in SUPER_DRAW_PAGES:
         try:
@@ -266,10 +279,12 @@ def find_super_draws(today: dt.date, fetcher=fetch) -> tuple[dict[str, str], int
         if status != 200:
             print(f"[super draw] {name}: HTTP {status}", file=sys.stderr)
             continue
-        ok += 1
         text = to_text(page)
+        # Loading isn't enough: a moved or emptied page would otherwise look healthy forever.
+        if SUPER_RE.search(text):
+            ok += 1
         for d, game in super_draw_dates(text, today).items():
-            found.setdefault(d.isoformat(), f"{game} Super Draw on {d.strftime('%A, %B %-d, %Y')} (via {name})")
+            found.setdefault(d.isoformat(), (game, f"{game} Super Draw on {long_date(d)} (via {name})"))
 
     for url, month_start in olg_condition_urls(today):
         try:
@@ -283,23 +298,27 @@ def find_super_draws(today: dt.date, fetcher=fetch) -> tuple[dict[str, str], int
         month_name = MONTHS[month_start.month - 1]
         if not (SUPER_RE.search(text) and month_name in text.lower()):
             continue  # soft 404 / unrelated page
+        ok += 1
         dates = {d: g for d, g in super_draw_dates(text, today, window=400).items()
                  if (d.year, d.month) == (month_start.year, month_start.month)}
         if dates:
             for d, game in dates.items():
-                found.setdefault(d.isoformat(),
-                                 f"{game} Super Draw on {d.strftime('%A, %B %-d, %Y')} (via OLG)")
+                found.setdefault(d.isoformat(), (game, f"{game} Super Draw on {long_date(d)} (via OLG)"))
         else:
             key = month_start.strftime("%Y-%m")
             if not any(k.startswith(key) for k in found):
-                found[key] = f"Lotto 6/49 Super Draw in {month_start.strftime('%B %Y')} (via OLG) - {url}"
+                found[key] = ("Lotto 6/49",
+                              f"Lotto 6/49 Super Draw in {month_start:%B %Y} (via OLG) - {url}")
     return found, ok
 
 
-def check_super_draws(state: dict, found: dict[str, str], today: dt.date) -> list[dict]:
+def check_super_draws(state: dict, found: dict[str, tuple[str, str]], today: dt.date) -> list[dict]:
     sd = state.setdefault("super_draws", {"announced": [], "reminded": []})
+    games = sd.setdefault("games", {})  # exact date -> game, for the day-of reminder
     alerts = []
-    for key, desc in sorted(found.items()):
+    for key, (game, desc) in sorted(found.items()):
+        if len(key) == 10:
+            games.setdefault(key, game)
         # A month-only key is superseded once we learn the exact date in that month.
         if key in sd["announced"]:
             continue
@@ -308,20 +327,24 @@ def check_super_draws(state: dict, found: dict[str, str], today: dt.date) -> lis
         if already:
             sd["announced"].append(key)
             continue
-        alerts.append({"title": "Super Draw announced", "body": desc,
-                       "priority": "default", "tags": "tada"})
+        alert = {"title": "Super Draw announced", "body": desc, "priority": "default", "tags": "tada"}
+        if len(key) == 10:
+            alert["expires"] = key
+        alerts.append(alert)
         sd["announced"].append(key)
     # Day-of reminder for any known exact date.
     today_s = today.isoformat()
     if today_s in sd["announced"] and today_s not in sd["reminded"]:
         alerts.append({"title": "Super Draw is TONIGHT",
-                       "body": "Lotto 6/49 Super Draw tonight - ticket sales close at 10:30 pm ET.",
-                       "priority": "high", "tags": "alarm_clock"})
+                       "body": f"{games.get(today_s, 'Lotto 6/49')} Super Draw tonight - "
+                               f"ticket sales close at 10:30 pm ET.",
+                       "priority": "high", "tags": "alarm_clock", "expires": today_s})
         sd["reminded"].append(today_s)
     # Keep the state file small: forget anything older than ~a year.
     cutoff = (today - dt.timedelta(days=400)).isoformat()
     sd["announced"] = sorted({k for k in sd["announced"] if k >= cutoff[:len(k)]})
     sd["reminded"] = sorted({k for k in sd["reminded"] if k >= cutoff})
+    sd["games"] = {k: g for k, g in sorted(games.items()) if k >= cutoff}
     return alerts
 
 
@@ -376,7 +399,7 @@ def notify(alert: dict, dry_run: bool) -> None:
     if errors:
         print("Notification errors: " + "; ".join(errors), file=sys.stderr)
     if not sent:
-        # Fail loudly: GitHub emails the repo owner when a scheduled workflow fails.
+        # send_all() keeps the alert for a retry and main() then fails the run, so GitHub emails you.
         raise RuntimeError("No notification channel succeeded (set NTFY_TOPIC and/or SMTP_*).")
 
 
@@ -412,11 +435,11 @@ def run(state: dict, now: dt.datetime, fetcher=fetch) -> list[dict]:
 
     found, ok_sources = find_super_draws(today, fetcher)
     alerts += track_health(state, "super_draw_failures", ok_sources > 0, "Checking for Super Draws")
-    print(f"Super Draws seen: {found or 'none'}")
+    print("Super Draws seen: " + ("; ".join(desc for _, desc in found.values()) or "none"))
     alerts += check_super_draws(state, found, today)
 
-    hb = os.getenv("HEARTBEAT_WEEKDAY", "").strip()
-    if hb and int(hb) == today.weekday() and state.get("last_heartbeat") != today.isoformat():
+    hb = env_int("HEARTBEAT_WEEKDAY", -1)
+    if hb == today.weekday() and state.get("last_heartbeat") != today.isoformat():
         jp = state.get("lotto_max", {}).get("last_jackpot")
         alerts.append({"title": "Lotto watch: weekly check-in",
                        "body": f"Still running. Lotto Max is at {fmt_money(jp) if jp else 'unknown'}.",
@@ -427,6 +450,24 @@ def run(state: dict, now: dt.datetime, fetcher=fetch) -> list[dict]:
     return alerts
 
 
+def send_all(state: dict, alerts: list[dict], today: dt.date, dry_run: bool, notifier=notify) -> int:
+    """Send leftovers from a failed run, then the new alerts. Anything that can't be sent goes
+    back into state["outbox"] for next run, so it isn't lost and the ones that worked don't repeat.
+    Returns how many failed."""
+    today_s = today.isoformat()
+    queued = [a for a in state.pop("outbox", []) if a.get("expires", today_s) >= today_s]
+    failed = []
+    for a in queued + alerts:
+        try:
+            notifier(a, dry_run)
+        except RuntimeError as e:
+            print(f"Not sent ({a['title']}): {e}", file=sys.stderr)
+            failed.append(a)
+    if failed:
+        state["outbox"] = failed
+    return len(failed)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true", help="print alerts, don't send or save state")
@@ -435,19 +476,22 @@ def main() -> int:
     args = ap.parse_args()
     dry = args.dry_run or env_bool("DRY_RUN", False)
 
+    failed = 0
     if args.test_notify:
         notify({"title": "Lotto watch test", "body": "If you can read this, alerts are working.",
                 "priority": "default", "tags": "white_check_mark"}, dry)
-        return 0
+    else:
+        path = Path(args.state)
+        state = json.loads(path.read_text()) if path.exists() and path.read_text().strip() else {}
+        now = dt.datetime.now(TZ)
+        failed = send_all(state, run(state, now), now.date(), dry)
+        if not dry:
+            path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
 
-    path = Path(args.state)
-    state = json.loads(path.read_text()) if path.exists() and path.read_text().strip() else {}
-    alerts = run(state, dt.datetime.now(TZ))
-    for a in alerts:
-        notify(a, dry)
-    if not dry:
-        path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-    return 0
+    if CONFIG_ERRORS:
+        print("Config problems: " + "; ".join(CONFIG_ERRORS), file=sys.stderr)
+    # Fail loudly (GitHub emails the repo owner) - state, including the outbox, is already saved.
+    return 1 if failed or CONFIG_ERRORS else 0
 
 
 if __name__ == "__main__":

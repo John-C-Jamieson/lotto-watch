@@ -46,8 +46,8 @@ Repo **Settings → Secrets and variables → Actions → Variables** tab:
 ## How it works
 - **Lotto Max jackpot:** read from WCLC's home page (an official provincial lottery; it shows the next jackpot in plain HTML), with lottery.fm as a fallback. OLG's own site loads the number with JavaScript, so it isn't used.
 - **Super Draws:** scans PlayNow's (BCLC) Super Draw page and WCLC for "Super Draw" followed by a future date, and probes OLG's predictable game-conditions URLs (`…/lotto-649-super-draw/november-2026.html`) for the next few months.
-- **State:** `state.json` gets committed back to the repo so you get each alert once. The daily commit also keeps GitHub from auto-disabling the schedule (it does that after 60 days with no repo activity).
-- **Failure handling:** if a notification can't be sent, the run fails and GitHub emails you.
+- **State:** `state.json` gets committed back to the repo so you get each alert once. (GitHub only auto-disables schedules in *public* repos after 60 days of inactivity; a private repo isn't affected.)
+- **Failure handling:** if a notification can't be sent, it's kept in `state.json` and retried on the next run (unless its draw has passed), and the run fails so GitHub emails you. An invalid setting (e.g. `HEARTBEAT_WEEKDAY=Mon`) falls back to the default and also fails the run, after any alerts have gone out.
 
 ## Run locally / tests
 ```bash
