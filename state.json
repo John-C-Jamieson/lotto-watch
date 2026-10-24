@@ -3,10 +3,10 @@
     "lotto_max_failures": 0,
     "super_draw_failures": 0
   },
-  "last_run": "2026-10-23T13:53:27-04:00",
+  "last_run": "2026-10-24T12:37:46-04:00",
   "lotto_max": {
-    "last_draw": "2026-10-23",
-    "last_jackpot": 20000000
+    "last_draw": "2026-10-27",
+    "last_jackpot": 25000000
   },
   "super_draws": {
     "announced": [
