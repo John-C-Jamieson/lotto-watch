@@ -3,17 +3,19 @@
     "lotto_max_failures": 0,
     "super_draw_failures": 0
   },
-  "last_run": "2026-11-02T17:20:43-05:00",
+  "last_run": "2026-11-03T15:08:00-05:00",
   "lotto_max": {
     "last_draw": "2026-11-03",
     "last_jackpot": 40000000
   },
   "super_draws": {
     "announced": [
-      "2026-10-31"
+      "2026-10-31",
+      "2026-11-28"
     ],
     "games": {
-      "2026-10-31": "Lotto 6/49"
+      "2026-10-31": "Lotto 6/49",
+      "2026-11-28": "Lotto 6/49"
     },
     "reminded": [
       "2026-10-31"
